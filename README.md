@@ -151,6 +151,8 @@ Splits are strictly **chronological**.
 
 ## Results
 
+> 🚨 **Историческая правка (2026-05-02).** В предыдущей итерации вызывался `ta.dpo(..., lookahead=False)` — этого параметра **нет в API pandas_ta**, он молча попадал в `**kwargs` и DPO считался с `centered=True` (default), что создавало look-ahead bias на ~length/2 свечей вперёд (см. [pandas_ta Issue #60](https://github.com/twopirllc/pandas-ta/issues/60)). Это завышало AUC до ~0.82 — фейк. После фикса (`centered=False`) и полного аудита всех 109 индикаторов через [scripts/leakage_audit.py](scripts/leakage_audit.py) и [scripts/leakage_audit2.py](scripts/leakage_audit2.py) все остальные индикаторы прошли проверку на связь с будущими значениями. Ниже — честные метрики.
+
 ### Pipeline funnel
 
 | Stage | Columns / Rows |
@@ -160,24 +162,24 @@ Splits are strictly **chronological**.
 | After NaN(>20%) filter | 165 |
 | Rows after `dropna()` | 35 658 |
 | Columns after `series_to_supervised(n_in=3)` | 660 |
-| After `\|corr\| > 0.95` filter | 302 |
-| After permutation-importance pruning | **178** |
+| After `&#124;corr&#124; > 0.95` filter | 298 |
+| After permutation-importance pruning | **57** |
 | Train / Valid / Calib | 24 958 / 5 348 / 5 349 |
 
-### A/B comparison: Baseline vs Permutation-Pruned
+### A/B comparison: Baseline vs Permutation-Pruned (honest, no leakage)
 
-| Stage | Features | Acc Valid | AUC Valid | AUC Calib |
-|---|---|---|---|---|
-| Baseline XGB | 302 | 0.7392 | 0.8141 | 0.8167 |
-| **Pruned XGB** | **178** | **0.7390** | **0.8172** | **0.8175** |
-| Pruned + Platt | 178 | **0.7416** | 0.8172 | **0.8175** (Acc 0.7443) |
+| Stage | Features | Acc Valid | AUC Valid | LogLoss Valid | Brier Valid |
+|---|---|---|---|---|---|
+| Baseline XGB | 298 | 0.5183 | 0.5213 | 0.6916 | 0.2493 |
+| **Pruned XGB** | **57** | 0.5198 | **0.5278** | 0.6914 | 0.2491 |
+| Pruned + Platt | 57 | **0.5366** | 0.5278 | **0.6886** | **0.2478** |
 
 **Key observations:**
-- AUC on validation **≈ 0.817** — a strong edge above random (0.5)
-- Permutation pruning removed **41% of features (124 cols)** without losing AUC; the pruned model is selected as final
-- Best XGBoost iteration: baseline = 362, pruned = 486 (early stopping)
-- Platt calibration adds a small but consistent accuracy boost
-- No transaction costs or slippage are modeled in these metrics
+- AUC on validation **≈ 0.52–0.53** — marginal edge above random (0.5), ожидаемый режим для 5-минутного intraday на чисто технических признаках
+- Permutation pruning убирает **81% признаков (241 из 298)** — большинство из них в реальности шум
+- Best XGBoost iteration: 14 (baseline) / 27 (pruned) — модель быстро упирается в предел сигнала
+- Platt calibration даёт заметный буст по accuracy (0.5198 → 0.5366) и LogLoss
+- No transaction costs or slippage are modeled — при таком AUC издержки весь сигнал съедят
 
 ---
 
