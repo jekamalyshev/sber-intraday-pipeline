@@ -25,11 +25,16 @@
 
 This pipeline researches the feasibility of predicting the **direction of the next 5-minute candle** for SBER (Sberbank, MOEX) using classical technical features and a gradient-boosted tree classifier with probability calibration.
 
-**Target variable:**
+**Target variable (обновлён 2026-05-02 по итогам эксперимента A3):**
 ```
-target_is_green_next = 1  if next 5m candle closes above its open (bullish)
-                      0  otherwise (bearish / doji)
+fwd = (CLOSE.shift(-K_BARS) - CLOSE) / atr_14    # K_BARS=5, K_ATR=1.0
+
+target_is_green_next = 1   if fwd >=  K_ATR   (рост >=1·ATR за 5 свечей)
+                       0   if fwd <= -K_ATR   (падение >=1·ATR за 5 свечей)
+                       NaN otherwise            (флэт/шум — строка отбрасывается)
 ```
+
+Ранее использовался target = «следующая свеча зелёная» — давал AUC≈0.52 OOS. ATR-target отфильтровывает ~55% баров без значимого движения и поднимает AUC до ~0.57–0.58 OOS при идеально сбалансированных классах 50/50.
 
 **Key design constraint:** All features are computed using **only current-bar-close or past-bar data**. No look-ahead bias by design (PSAR is collapsed into a single causal `psar_value` + `psar_is_long` pair; Ichimoku forward spans and Volume Profile rows are excluded).
 
@@ -43,9 +48,10 @@ target_is_green_next = 1  if next 5m candle closes above its open (bullish)
 | Timeframe | 5-minute candles |
 | Source | Finam (CSV export) |
 | Columns | TICKER, PER, DATE, TIME, OPEN, HIGH, LOW, CLOSE, VOL |
-| Total rows | ~41 657 bars |
+| Total rows (raw) | ~41 657 bars |
+| Rows after ATR-target filter | ~18 844 bars (~45%) |
 | Date range | From 2024-01-03 |
-| Class balance | Red (0): ~53% · Green (1): ~47% |
+| Class balance (ATR-target) | down >=1·ATR (0): ~50% · up >=1·ATR (1): ~50% |
 
 The raw CSV is **not included** in this repository (proprietary Finam data). Place your file at `./Сбербанк/year_result.csv` before running.
 
@@ -154,33 +160,38 @@ Splits are strictly **chronological**.
 
 > 🚨 **Историческая правка (2026-05-02).** В предыдущей итерации вызывался `ta.dpo(..., lookahead=False)` — этого параметра **нет в API pandas_ta**, он молча попадал в `**kwargs` и DPO считался с `centered=True` (default), что создавало look-ahead bias на ~length/2 свечей вперёд (см. [pandas_ta Issue #60](https://github.com/twopirllc/pandas-ta/issues/60)). Это завышало AUC до ~0.82 — фейк. После фикса (`centered=False`) и полного аудита всех 109 индикаторов через [scripts/leakage_audit.py](scripts/leakage_audit.py) и [scripts/leakage_audit2.py](scripts/leakage_audit2.py) все остальные индикаторы прошли проверку на связь с будущими значениями. Ниже — честные метрики.
 
-### Pipeline funnel
+### Pipeline funnel (с ATR-target K_BARS=5, K_ATR=1.0)
 
 | Stage | Columns / Rows |
 |---|---|
 | TA indicators added | 109 |
 | Features after generation | 173 |
 | After NaN(>20%) filter | 165 |
-| Rows after `dropna()` | 35 658 |
+| Rows after ATR-target filter + `dropna()` | 15 958 |
 | Columns after `series_to_supervised(n_in=3)` | 660 |
-| After `&#124;corr&#124; > 0.95` filter | 298 |
-| After permutation-importance pruning | **57** |
-| Train / Valid / Calib | 24 958 / 5 348 / 5 349 |
+| After `&#124;corr&#124; > 0.95` filter | 347 |
+| After permutation-importance pruning | **69** |
+| Train / Valid / Calib | 11 170 / 2 393 / 2 395 |
 
-### A/B comparison: Baseline vs Permutation-Pruned (honest, no leakage)
+### A/B comparison: Baseline vs Permutation-Pruned (итог после A3)
 
-| Stage | Features | Acc Valid | AUC Valid | LogLoss Valid | Brier Valid |
+Метрики со сплита Calib (out-of-sample, ~15% хвост ряда):
+
+| Stage | Features | Acc Calib | AUC Calib | LogLoss Calib | Brier Calib |
 |---|---|---|---|---|---|
-| Baseline XGB | 298 | 0.5183 | 0.5213 | 0.6916 | 0.2493 |
-| **Pruned XGB** | **57** | 0.5198 | **0.5278** | 0.6914 | 0.2491 |
-| Pruned + Platt | 57 | **0.5366** | 0.5278 | **0.6886** | **0.2478** |
+| Baseline XGB | 347 | 0.5203 | 0.5459 | 0.6892 | 0.2480 |
+| **Pruned XGB** | **69** | **0.5616** | **0.5670** | **0.6857** | **0.2463** |
+| XGB + Platt | 347 | 0.5257 | 0.5459 | 0.6891 | 0.2480 |
+
+Для сравнения, старый target «зелёная свеча» (для референса): Pruned XGB Valid AUC=0.5278, Acc=0.5198 — т.е. **новый ATR-target даёт +4pp к AUC и +4pp к accuracy на OOS** при вдвое меньшей выборке.
 
 **Key observations:**
-- AUC on validation **≈ 0.52–0.53** — marginal edge above random (0.5), ожидаемый режим для 5-минутного intraday на чисто технических признаках
-- Permutation pruning убирает **81% признаков (241 из 298)** — большинство из них в реальности шум
-- Best XGBoost iteration: 14 (baseline) / 27 (pruned) — модель быстро упирается в предел сигнала
-- Platt calibration даёт заметный буст по accuracy (0.5198 → 0.5366) и LogLoss
-- No transaction costs or slippage are modeled — при таком AUC издержки весь сигнал съедят
+- AUC OOS **≈ 0.55–0.57** — реалистичный edge для 5-минутного intraday после фильтрации «флэтовых» баров
+- Permutation pruning убирает **278 из 347 признаков (80%)** — большинство в реальности шум, прунинг улучшает обобщаемость
+- Best XGBoost iteration: 16 (baseline) / 24 (pruned) — модель быстро упирается в предел сигнала
+- Pruned XGB выбран финальной моделью: AUC=0.567, Acc=0.562, LogLoss=0.686 на Calib
+- ATR-target даёт идеально сбалансированные классы 50/50 и поднимает AUC на +4pp против базового target
+- No transaction costs or slippage в самом ноутбуке — см. секцию A4+A2 ниже и [`scripts/threshold_strategy.py`](scripts/threshold_strategy.py) для P&L с издержками
 
 ---
 
@@ -326,7 +337,7 @@ The `series_to_supervised(n_in=3)` creates 3-step lag features without ablation.
 
 - [x] Look-ahead bias audit (DPO `centered=False` fix — see историческую правку в [Results](#results))
 - [x] A4+A2: стратегия «торгуем только в хвостах» + P&L с издержками (неприбыльно при 10 bps)
-- [x] A3: альтернативный target = движение ≥ k·ATR за k свечей + grid search (победитель k=5, k_atr=1.0, AUC 0.580 OOS)
+- [x] A3: альтернативный target = движение ≥ k·ATR за k свечей + grid search (победитель k=5, k_atr=1.0, AUC 0.567–0.580 OOS) — **внедрён как основной target в [`sber_intraday_pipeline.ipynb`](sber_intraday_pipeline.ipynb)**
 - [ ] Walk-forward cross-validation (`TimeSeriesSplit`) на ATR-конфиге
 - [ ] Net P&L backtest with commission + slippage model на ATR-конфиге
 - [ ] Regime detection (HMM or volatility-regime filter)
