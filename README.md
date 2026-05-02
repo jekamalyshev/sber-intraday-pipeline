@@ -158,7 +158,7 @@ Observation: на текущей выборке CatBoost быстро сходи
 
 Splits are strictly **chronological**.
 
-> ⚠️ **Walk-forward / time-series cross-validation is not yet implemented.** The current split is a simple chronological hold-out — see [Known Limitations](#known-limitations--weaknesses).
+> ✅ **Walk-forward CV выполнен** — см. [специальный раздел](#walk-forward-cv-проверка-стабильности-edge) ниже: пять expanding-window фолдов с embargo=k_bars=3 дают AUC mean=0.553±0.040 — реальный OOS-edge ниже, чем показывает одиночный hold-out (0.60).
 
 ---
 
@@ -307,6 +307,40 @@ Grid search по конфигам k_bars ∈ {1, 3, 5} × k_atr ∈ {0.5 .. 1.5}
 
 ---
 
+## Walk-forward CV: проверка стабильности edge
+
+> **Ключевой вопрос:** AUC OOS = 0.6004 на одиночном hold-out — это стабильный edge или удачный кусок ряда? Прогнал walk-forward с 5 фолдами и embargo=k_bars=3 бара между train и test (для изоляции утечки через forward-looking target).
+
+**Схема:** expanding-window — первые 50% ряда идут в минимальный train, оставшиеся разбиты на 5 равных блоков; на каждом фолде train растёт, test — следующий блок, после train embargo 3 бара. Скрипт: [`scripts/walk_forward_cv.py`](scripts/walk_forward_cv.py), результаты: [`scripts/walk_forward_cv_results.json`](scripts/walk_forward_cv_results.json).
+
+| Fold | Train rows | Test rows | best_iter | AUC | Acc | LogLoss | Test pos rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 6 045 | 1 209 | 16 | 0.5424 | 0.5418 | 0.6904 | 0.513 |
+| 2 | 7 254 | 1 209 | 79 | 0.5028 | 0.4979 | 0.6990 | 0.461 |
+| 3 | 8 463 | 1 209 | 48 | 0.5410 | 0.5203 | 0.6946 | 0.512 |
+| 4 | 9 672 | 1 209 | 40 | 0.5521 | 0.5352 | 0.6894 | 0.472 |
+| 5 | 10 881 | 1 213 | 285 | **0.6265** | 0.6026 | 0.6721 | 0.460 |
+| **Mean ± std** | | | | **0.5530 ± 0.0404** | 0.5396 ± 0.0357 | 0.6891 | |
+| Min / Median / Max | | | | 0.5028 / 0.5424 / 0.6265 | | | |
+
+**Одиночный split (для сравнения):** AUC = **0.6004** — это ровно последний (5-й) блок ряда, на котором CV даёт 0.6265. На более ранних фолдах модель работает хуже (0.50–0.55).
+
+### Что это значит
+
+1. **AUC=0.60 НЕ стабилен во времени.** Разброс по фолдам жёсткий: 0.50 → 0.63. Честная оценка OOS-edge — **AUC ≈ 0.55 ± 0.04**, а не 0.60.
+2. **Fold 2 (AUC=0.50) — сигнал почти исчезает.** Это или режимный сдвиг (ломаются выученные паттерны), или период низкой волатильности без информативного движения.
+3. **Fold 5 совпадает с hold-out (AUC ≈ 0.60–0.63).** Последняя часть ряда действительно «удобная» для модели, но экстраполировать этот результат на «AUC=0.60 везде в будущем» нельзя.
+4. **best_iter растёт с данными линейно:** 16 → 79 → 48 → 40 → 285. На последнем фолде модель использует в 6× больше деревьев — признак того, что она находит реальные паттерны, но их сила зависит от объёма истории.
+
+### Рекомендации
+
+- **Рабочая оценка edge — AUC ≈ 0.55**, что делает прибыльность стратегии после издержек очень маргинальной (10 bps spread + slippage уже съедает сигнал).
+- **Режимная фильтрация — обязательный следующий шаг.** Fold 2 показывает, что бывают периоды, когда модель лучше не торговать вообще.
+- **Переход на sliding-window** (фиксированный train вместо expanding) может помочь, если старые данные портят новую выборку (режимы меняются).
+- **Fold-2 расследование:** посмотреть волатильность/тренд/объёмы на этом периоде — возможно, там флэт/режимный сдвиг.
+
+---
+
 ## Project Structure
 
 ```
@@ -420,7 +454,7 @@ The `series_to_supervised(n_in=3)` creates 3-step lag features without ablation.
 - [x] Model zoo на ATR-target — победитель CatBoost (AUC=0.606 vs XGB 0.567) — см. [`scripts/model_zoo_atr.py`](scripts/model_zoo_atr.py)
 - [x] Timeframe test 5m/10m/15m — оставаться на 5m — см. [`scripts/timeframe_test.py`](scripts/timeframe_test.py)
 - [x] **Combined: CatBoost + k_bars=3, k_atr=1.0 → AUC_c = 0.6004** — внедрён как основная конфигурация в [`sber_intraday_pipeline.ipynb`](sber_intraday_pipeline.ipynb)
-- [ ] Walk-forward cross-validation (`TimeSeriesSplit`) на ATR-конфиге
+- [x] Walk-forward CV (`TimeSeriesSplit` + embargo=k_bars) на ATR-конфиге — см. [раздел Walk-forward CV](#walk-forward-cv-проверка-стабильности-edge) (5 фолдов, AUC mean=0.553±0.040, single-split был 0.60 — оптимистичен)
 - [ ] Net P&L backtest with commission + slippage model на ATR-конфиге
 - [ ] Regime detection (HMM or volatility-regime filter)
 - [ ] Hyperparameter search (Optuna) with purged CV
