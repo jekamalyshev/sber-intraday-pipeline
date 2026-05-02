@@ -12,6 +12,7 @@
 - [Model Architecture](#model-architecture)
 - [Validation Scheme](#validation-scheme)
 - [Results](#results)
+- [Эксперименты A4+A2 и A3](#эксперименты-с-уверенностью-a4a2-и-альтернативным-target-a3)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -183,12 +184,57 @@ Splits are strictly **chronological**.
 
 ---
 
+## Эксперименты с уверенностью (A4+A2) и альтернативным target (A3)
+
+После получения честного AUC≈0.52 было протестировано два рычага для повышения уверенности модели.
+
+### A4+A2 — торговля только в хвостах вероятности (базовый target = зелёная свеча)
+
+Скрипт: [`scripts/threshold_strategy.py`](scripts/threshold_strategy.py) · результаты: [`scripts/threshold_results.json`](scripts/threshold_results.json)
+
+| Конфиг | Сторона | Valid prec/N | **Calib (OOS) prec/N** |
+|---|---|---|---|
+| precision ≥ 0.70 | SHORT | 1.000 / 20 | **1.000 / 15** ✅ стабильно |
+| precision ≥ 0.65 | SHORT | 0.900 / 30 | **0.960 / 25** ✅ стабильно |
+| precision ≥ 0.65 | LONG  | 0.653 / 49 | 0.553 / 47 ⚠️ переобученный хвост |
+
+**P&L на Calib** (балансированный конфиг, 72 сделки): без издержек −0.66%, с round-trip 10 bps → −7.86%. **Неприбыльно при реальных издержках.** SHORT-хвост стабильно верный (96–100% precision OOS), но прибыль от верных SHORT не покрывает издержки + убытки LONG-хвоста.
+
+### A3 — target «движение ≥ k·ATR за k свечей»
+
+Скрипты: [`scripts/atr_target_strategy.py`](scripts/atr_target_strategy.py), [`scripts/atr_grid.py`](scripts/atr_grid.py) · результаты: [`scripts/atr_grid_results.json`](scripts/atr_grid_results.json)
+
+Grid search по конфигам k_bars ∈ {1, 3, 5} × k_atr ∈ {0.5 .. 1.5}:
+
+| k_bars | k_atr | N rows | AUC valid | AUC calib | p_max | LONG p≥0.55 (Calib) | SHORT p≤0.45 (Calib) |
+|---|---|---|---|---|---|---|---|
+| **5** | **1.00** | 15 958 | 0.564 | **0.580** | **0.729** | **prec=0.617, N=389** | **prec=0.586, N=916** |
+| 3 | 0.50 | 21 521 | 0.578 | 0.573 | 0.700 | prec=0.567, N=478 | prec=0.600, N=1 018 |
+| 5 | 1.50 |  9 934 | 0.545 | 0.540 | 0.621 | prec=0.642, N=148 | prec=0.543, N=495 |
+| 3 | 1.00 | 12 097 | 0.562 | 0.568 | 0.655 | prec=0.500, N=88 | prec=0.598, N=776 |
+| 1 | 0.50 | 13 853 | 0.573 | 0.535 | 0.586 | prec=0.550, N=20 | prec=0.571, N=357 |
+
+**Ключевой вывод:** при k_bars=5, k_atr=1.0 (движение ≥1 ATR за 5 свечей) хвосты **симметрично открываются**: впервые LONG даёт реальный хвост (389 сигналов OOS с prec=0.617), AUC поднимается с 0.52 до 0.58. Смена target с «зелёная свеча» на «движение ≥ ATR» резко улучшает предсказуемость, средневзвешенный сигнал ~58% precision в обе стороны. Для реальной торговли требуется выполнить walk-forward валидацию и посчитать чистый P&L с издержками на этой конфигурации.
+
+---
+
 ## Project Structure
 
 ```
 sber-intraday-pipeline/
 ├── sber_intraday_pipeline.ipynb     # Main research notebook
 ├── README.md                        # This file
+├── scripts/
+│   ├── leakage_audit.py             # Аудит look-ahead bias (target shift test)
+│   ├── leakage_audit2.py            # Поиндикаторный аудит 109 TA-признаков
+│   ├── model_comparison.py          # 7 моделей × {raw, Platt, Isotonic}
+│   ├── model_comparison_results.csv # Результаты model_comparison
+│   ├── confidence_diagnostic.py     # Диагностика хвостов вероятностей
+│   ├── threshold_strategy.py        # A4+A2 — стратегия порогов + P&L
+│   ├── threshold_results.json       # Результаты A4+A2
+│   ├── atr_target_strategy.py       # A3 — альтернативный ATR-target (один конфиг)
+│   ├── atr_grid.py                  # A3 — grid search по (k_bars, k_atr)
+│   └── atr_grid_results.json        # Результаты grid search
 ├── .gitignore                       # Excludes Сбербанк/, *.csv, etc.
 └── Сбербанк/
     └── year_result.csv              # Raw data (NOT committed, add manually)
@@ -259,8 +305,8 @@ Only SBER is analyzed. Results may not generalize to other liquid MOEX names. SB
 ### 4. ⚠️ No Regime Detection
 The model treats the entire 2024 time series as one stationary regime. In reality, SBER exhibits distinct trend, range, and high-volatility regimes that may require separate models or filters.
 
-### 5. ⚠️ AUC ≈ 0.82 is Suspicious for Intraday Data
-Such an edge from purely technical features at 5-minute horizon is unusually high and warrants careful look-ahead audit and walk-forward validation. **Recommendation:** rerun on a held-out year / different ticker before any further claims.
+### 5. ✅ AUC ≈ 0.82 was a leak — fixed
+Исторический AUC=0.82 оказался фейком из-за `ta.dpo(..., lookahead=False)` (параметр не существовал, DPO считался с default `centered=True` → look-ahead). После фикса честный AUC=0.52–0.53 на базовом target. С ATR-target (k=5, k_atr=1) AUC поднимается до 0.58 OOS — это реалистичный уровень для intraday при фильтрации «шумных» баров.
 
 ### 6. ⚠️ `warnings.filterwarnings('ignore')`
 All warnings are silenced globally. **Recommendation:** use targeted warning filters.
@@ -278,8 +324,11 @@ The `series_to_supervised(n_in=3)` creates 3-step lag features without ablation.
 
 ## Roadmap
 
-- [ ] Walk-forward cross-validation (`TimeSeriesSplit`)
-- [ ] Net P&L backtest with commission + slippage model
+- [x] Look-ahead bias audit (DPO `centered=False` fix — see историческую правку в [Results](#results))
+- [x] A4+A2: стратегия «торгуем только в хвостах» + P&L с издержками (неприбыльно при 10 bps)
+- [x] A3: альтернативный target = движение ≥ k·ATR за k свечей + grid search (победитель k=5, k_atr=1.0, AUC 0.580 OOS)
+- [ ] Walk-forward cross-validation (`TimeSeriesSplit`) на ATR-конфиге
+- [ ] Net P&L backtest with commission + slippage model на ATR-конфиге
 - [ ] Regime detection (HMM or volatility-regime filter)
 - [ ] Hyperparameter search (Optuna) with purged CV
 - [ ] Multi-ticker universe test

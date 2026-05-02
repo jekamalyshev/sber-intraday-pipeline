@@ -1,0 +1,44 @@
+[
+  {
+    "config": "conservative (precision >= 0.70)",
+    "target_prec": 0.7,
+    "thr_long": null,
+    "n_long_va": 0,
+    "prec_long_va": null,
+    "thr_short": 0.3,
+    "n_short_va": 20.0,
+    "prec_short_va": 1.0,
+    "n_long_ca": 0,
+    "prec_long_ca": NaN,
+    "n_short_ca": 15.0,
+    "prec_short_ca": 1.0
+  },
+  {
+    "config": "balanced     (precision >= 0.65)",
+    "target_prec": 0.65,
+    "thr_long": 0.606,
+    "n_long_va": 49.0,
+    "prec_long_va": 0.6530612244897959,
+    "thr_short": 0.359,
+    "n_short_va": 30.0,
+    "prec_short_va": 0.9,
+    "n_long_ca": 47.0,
+    "prec_long_ca": 0.5531914893617021,
+    "n_short_ca": 25.0,
+    "prec_short_ca": 0.96
+  },
+  {
+    "config": "aggressive   (precision >= 0.60)",
+    "target_prec": 0.6,
+    "thr_long": 0.604,
+    "n_long_va": 51.0,
+    "prec_long_va": 0.6274509803921569,
+    "thr_short": 0.416,
+    "n_short_va": 50.0,
+    "prec_short_va": 0.8,
+    "n_long_ca": 52.0,
+    "prec_long_ca": 0.5576923076923077,
+    "n_short_ca": 49.0,
+    "prec_short_ca": 0.7959183673469388
+  }
+]
