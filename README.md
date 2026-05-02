@@ -22,7 +22,7 @@
 
 ## Overview
 
-This pipeline researches the feasibility of predicting the **direction of the next 5-minute candle** for SBER (Sberbank, MOEX) using classical technical features and a gradient-boosted tree classifier.
+This pipeline researches the feasibility of predicting the **direction of the next 5-minute candle** for SBER (Sberbank, MOEX) using classical technical features and a gradient-boosted tree classifier with probability calibration.
 
 **Target variable:**
 ```
@@ -30,7 +30,7 @@ target_is_green_next = 1  if next 5m candle closes above its open (bullish)
                       0  otherwise (bearish / doji)
 ```
 
-**Key design constraint:** All features are computed using **only current-bar-close or past-bar data**. No look-ahead bias by design.
+**Key design constraint:** All features are computed using **only current-bar-close or past-bar data**. No look-ahead bias by design (PSAR is collapsed into a single causal `psar_value` + `psar_is_long` pair; Ichimoku forward spans and Volume Profile rows are excluded).
 
 ---
 
@@ -44,9 +44,9 @@ target_is_green_next = 1  if next 5m candle closes above its open (bullish)
 | Columns | TICKER, PER, DATE, TIME, OPEN, HIGH, LOW, CLOSE, VOL |
 | Total rows | ~41 657 bars |
 | Date range | From 2024-01-03 |
-| Class balance | Red (0): 53% · Green (1): 47% |
+| Class balance | Red (0): ~53% · Green (1): ~47% |
 
-The raw CSV is **not included** in this repository (proprietary Finam data). Place your file at `./yearresult.csv` before running.
+The raw CSV is **not included** in this repository (proprietary Finam data). Place your file at `./Сбербанк/year_result.csv` before running.
 
 ---
 
@@ -80,17 +80,20 @@ Features are grouped into four categories, all computed without look-ahead:
 - Flags: `is_opening_30m`, `is_first_hour`, `is_first_bar_of_day`
 - Bar index within day (`bar_in_day`)
 
-### 4. Technical Indicators (via `pandas-ta`)
-- EMA 10/20, SMA 20
-- RSI 14
-- ATR 14, NATR 14
-- MACD (12/26/9)
-- Bollinger Bands 20 (+ `close_pos_in_bbands`)
-- Stochastic (14/3/3)
-- OBV
-- Price vs EMA/SMA ratios
+### 4. Technical Indicators (via `pandas-ta`, ~109 indicators)
+Generated in **bulk via `try/except` across all `pandas_ta` indicator groups** — `trend`, `momentum`, `volatility`, `volume`, `statistics`, `overlap` — and then auto-pruned by quality filters. Risky look-ahead indicators (`ichimoku` ISA/ISB forward, `vp`) are explicitly excluded; PSAR is collapsed into a single causal `psar_value` + `psar_is_long` pair.
 
-**Total feature columns after lag embedding (nin=5):** ~90+ features × 5 lags.
+Examples produced (non-exhaustive): EMA / SMA / DEMA / TEMA / HMA / KAMA, RSI / Stoch / StochRSI / CCI / MFI / ROC / Williams %R, ATR / NATR / TRUE_RANGE / Bollinger Bands / Donchian / Keltner, OBV / CMF / EFI / AD, MACD, ADX / DMI, Aroon, etc.
+
+### 5. Filtering Pipeline
+After bulk TA generation the feature matrix passes through a deterministic filter chain:
+1. Drop columns with **>20% NaN**
+2. Drop **constant columns**
+3. `dropna()` rows
+4. **Lag embedding** via `series_to_supervised(n_in=3)`
+5. **Correlation filter:** drop one of every pair with `|corr| > 0.95`
+6. Drop constant columns introduced by lagging
+7. **Permutation-importance pruning** (sklearn `permutation_importance`, `n_repeats=5`, `scoring='neg_log_loss'`) — keep only features with importance > 0
 
 ---
 
@@ -98,32 +101,37 @@ Features are grouped into four categories, all computed without look-ahead:
 
 ```
 Raw CSV
-  └─► prepare_ohlcv_dataframe()   # parse, sort, type-cast
+  └─► prepare_ohlcv_dataframe()      # parse, sort, type-cast
         └─► add_domain_features()
-              └─► add_rolling_features()   # windows [6, 12, 24]
+              └─► add_rolling_features()      # windows [6, 12, 24]
                     └─► add_calendar_features()
-                          └─► add_ta_features()   # pandas-ta
-                                └─► add_target()   # shift(-1)
-                                      └─► build_X_y_for_model()  # series_to_supervised(nin=5)
-                                            └─► XGBClassifier  (baseline)
-                                                  └─► CalibratedClassifierCV (Platt sigmoid)
+                          └─► add_ta_features()       # ~109 pandas_ta indicators
+                                └─► add_target()
+                                      └─► build_X_y_for_model()   # series_to_supervised(n_in=3)
+                                            └─► NaN/const/corr filters
+                                                  └─► XGBClassifier  (baseline)
+                                                        └─► permutation_importance pruning
+                                                              └─► XGBClassifier  (pruned)
+                                                                    └─► CalibratedClassifierCV (Platt sigmoid, FrozenEstimator)
 ```
 
-**XGBoost hyperparameters (default research config):**
+**XGBoost hyperparameters (research config):**
 ```python
 XGBClassifier(
-    n_estimators=400,
+    n_estimators=600,
     max_depth=4,
     learning_rate=0.05,
     subsample=0.8,
-    colsample_bytree=0.8,
-    use_label_encoder=False,
+    colsample_bytree=0.7,
+    reg_alpha=0.1,
+    reg_lambda=1.0,
     eval_metric='logloss',
-    random_state=42
+    random_state=42,
+    early_stopping_rounds=30,
 )
 ```
 
-**Calibration:** Platt scaling via `CalibratedClassifierCV(method='sigmoid', cv='prefit')` on a dedicated calibration split.
+**Calibration:** Platt scaling via `CalibratedClassifierCV(method='sigmoid')` wrapped around a `FrozenEstimator` (sklearn ≥ 1.6) to fit on a dedicated calibration split. A fallback to legacy `cv='prefit'` is used for older sklearn versions.
 
 ---
 
@@ -131,28 +139,44 @@ XGBClassifier(
 
 | Split | Purpose | Approx. share |
 |---|---|---|
-| Train | Fit XGBoost | 60% |
-| Valid | Evaluate & tune | 20% |
-| Calib | Fit Platt scaler | 20% |
+| Train | Fit XGBoost | 70% |
+| Valid | Early stopping & evaluation | 15% |
+| Calib | Fit Platt scaler | 15% |
 
-> ⚠️ **Walk-forward / time-series cross-validation is not yet implemented.** The current split is a simple chronological hold-out. This is a known limitation — see [Known Limitations](#known-limitations--weaknesses).
+Splits are strictly **chronological**.
+
+> ⚠️ **Walk-forward / time-series cross-validation is not yet implemented.** The current split is a simple chronological hold-out — see [Known Limitations](#known-limitations--weaknesses).
 
 ---
 
 ## Results
 
-### Metrics Summary (XGBoost vs Calibrated)
+### Pipeline funnel
 
-| Split | XGB Acc | XGB AUC | XGB LogLoss | XGB Brier | Cal Acc | Cal AUC | Cal LogLoss | Cal Brier |
-|---|---|---|---|---|---|---|---|---|
-| Train | 0.5895 | 0.6276 | 0.6825 | 0.2447 | 0.5729 | 0.6276 | 0.6786 | 0.2428 |
-| Valid | 0.5197 | 0.5282 | 0.6909 | 0.2489 | 0.5343 | 0.5282 | 0.6886 | 0.2478 |
-| Calib | 0.5262 | 0.5326 | 0.6908 | 0.2488 | 0.5380 | 0.5326 | 0.6892 | 0.2481 |
+| Stage | Columns / Rows |
+|---|---|
+| TA indicators added | 109 |
+| Features after generation | 173 |
+| After NaN(>20%) filter | 165 |
+| Rows after `dropna()` | 35 658 |
+| Columns after `series_to_supervised(n_in=3)` | 660 |
+| After `\|corr\| > 0.95` filter | 302 |
+| After permutation-importance pruning | **178** |
+| Train / Valid / Calib | 24 958 / 5 348 / 5 349 |
+
+### A/B comparison: Baseline vs Permutation-Pruned
+
+| Stage | Features | Acc Valid | AUC Valid | AUC Calib |
+|---|---|---|---|---|
+| Baseline XGB | 302 | 0.7392 | 0.8141 | 0.8167 |
+| **Pruned XGB** | **178** | **0.7390** | **0.8172** | **0.8175** |
+| Pruned + Platt | 178 | **0.7416** | 0.8172 | **0.8175** (Acc 0.7443) |
 
 **Key observations:**
-- AUC on validation ≈ 0.528 — marginal edge above random (0.5), but modest
-- Train/Valid gap indicates mild overfitting
-- Platt calibration slightly reduces LogLoss and Brier score
+- AUC on validation **≈ 0.817** — a strong edge above random (0.5)
+- Permutation pruning removed **41% of features (124 cols)** without losing AUC; the pruned model is selected as final
+- Best XGBoost iteration: baseline = 362, pruned = 486 (early stopping)
+- Platt calibration adds a small but consistent accuracy boost
 - No transaction costs or slippage are modeled in these metrics
 
 ---
@@ -161,9 +185,11 @@ XGBClassifier(
 
 ```
 sber-intraday-pipeline/
-├── sber_intraday_pipeline-2.ipynb   # Main research notebook
+├── sber_intraday_pipeline.ipynb     # Main research notebook
 ├── README.md                        # This file
-└── yearresult.csv                   # Raw data (NOT included, add manually)
+├── .gitignore                       # Excludes Сбербанк/, *.csv, etc.
+└── Сбербанк/
+    └── year_result.csv              # Raw data (NOT committed, add manually)
 ```
 
 ---
@@ -176,36 +202,42 @@ pip install pandas numpy scikit-learn xgboost pandas-ta matplotlib seaborn packa
 
 | Package | Version tested |
 |---|---|
-| Python | 3.8.5 |
-| pandas | 1.4.2 |
-| numpy | 1.22.3 |
-| scikit-learn | 1.1.3 |
-| xgboost | 1.6.1 |
-| pandas-ta | latest |
+| Python | 3.12 |
+| pandas | 3.0.2 |
+| scikit-learn | 1.8.0 (`FrozenEstimator` API) |
+| xgboost | 3.2.0 |
+| pandas-ta | 0.4.71b0 |
+
+> The notebook auto-detects sklearn version: it uses `FrozenEstimator` on ≥ 1.6 and falls back to `cv='prefit'` on older versions.
 
 ---
 
 ## Usage
 
-1. Export 5-minute OHLCV data for SBER from Finam and save as `yearresult.csv` in the repo root.
-2. Open `sber_intraday_pipeline-2.ipynb` in Jupyter.
-3. Run all cells sequentially (Cell 1 → Cell 11).
+1. Export 5-minute OHLCV data for SBER from Finam and save as `./Сбербанк/year_result.csv` in the repo root.
+2. Open `sber_intraday_pipeline.ipynb` in Jupyter.
+3. Run all cells sequentially — or execute headlessly:
 
-**Cell map:**
+```bash
+jupyter nbconvert --to notebook --execute sber_intraday_pipeline.ipynb \
+    --output sber_intraday_pipeline.ipynb \
+    --ExecutePreprocessor.timeout=1200
+```
+
+**Cell map (30 cells):**
 
 | Cell | Purpose |
 |---|---|
-| 1 | Imports & display settings |
-| 2 | Helper: `series_to_supervised()` |
-| 3 | Feature engineering functions |
-| 4 | Master pipeline builder |
-| 5 | Load data & build feature DataFrame |
-| 6 | EDA — feature distributions |
-| 7 | Train/Valid/Calib split |
-| 8 | XGBoost baseline training & evaluation |
-| 9 | Probability calibration (Platt scaling) |
-| 10 | Metrics summary table |
-| 11 | Feature importance (permutation + gain) |
+| 0–9 | Imports, helpers, feature engineering functions, data load |
+| 11 | `build_feature_dataframe` — 109 TA indicators + target |
+| 13–14 | EDA — feature distributions and target balance |
+| 16 | `build_X_y_for_model(n_in=3)` + Train/Valid/Calib split + filters & diagnostic counters |
+| 18–19 | Baseline XGBoost training + classification report |
+| 20–21 | **Permutation-importance pruning + A/B comparison + final-model selection** |
+| 23 | Probability calibration (`FrozenEstimator` → Platt) |
+| 24 | Calibration plots |
+| 26 | Metrics summary table |
+| 28 | Feature importance (gain + permutation) |
 
 ---
 
@@ -214,34 +246,31 @@ pip install pandas numpy scikit-learn xgboost pandas-ta matplotlib seaborn packa
 This is a **research prototype**. Before treating any signal as tradeable, the following issues must be addressed:
 
 ### 1. 🚨 Single Chronological Split (No Walk-Forward CV)
-The model is validated on one fixed hold-out period. AUC ~0.528 may be inflated or deflated relative to out-of-sample performance across different market regimes. **Recommendation:** implement `TimeSeriesSplit` or a rolling walk-forward backtest.
+The model is validated on one fixed hold-out period. AUC ~0.817 may be inflated relative to out-of-sample performance across different market regimes. **Recommendation:** implement `TimeSeriesSplit` or a rolling walk-forward backtest.
 
 ### 2. 🚨 No Transaction Cost / Slippage Modeling
-All metrics are computed on raw predictions. Real MOEX trades incur brokerage commissions (~0.04–0.06%), exchange fees, and slippage. At 5-minute frequency, round-trip costs can easily consume a 50-52% win-rate edge. **Recommendation:** model net P&L with realistic cost assumptions before declaring any positive expectancy.
+All metrics are computed on raw predictions. Real MOEX trades incur brokerage commissions (~0.04–0.06%), exchange fees, and slippage. At 5-minute frequency, round-trip costs can erode an edge that looks robust at the AUC level. **Recommendation:** model net P&L with realistic cost assumptions before declaring positive expectancy.
 
 ### 3. ⚠️ Single Ticker / Survivorship Bias
-Only SBER is analyzed. Results may not generalize to other liquid MOEX names. SBER itself is a survivorship-bias-free choice (it has been continuously traded), but the strategy has not been tested on a broader universe.
+Only SBER is analyzed. Results may not generalize to other liquid MOEX names. SBER itself is a survivorship-bias-free choice (continuously traded), but the strategy has not been tested on a broader universe.
 
 ### 4. ⚠️ No Regime Detection
 The model treats the entire 2024 time series as one stationary regime. In reality, SBER exhibits distinct trend, range, and high-volatility regimes that may require separate models or filters.
 
-### 5. ⚠️ Feature Collinearity
-Many features (EMA10, EMA20, SMA20, close_vs_ma12, etc.) are highly correlated. XGBoost handles this implicitly, but permutation importance may be noisy. **Recommendation:** apply VIF analysis or a dimensionality reduction step.
+### 5. ⚠️ AUC ≈ 0.82 is Suspicious for Intraday Data
+Such an edge from purely technical features at 5-minute horizon is unusually high and warrants careful look-ahead audit and walk-forward validation. **Recommendation:** rerun on a held-out year / different ticker before any further claims.
 
 ### 6. ⚠️ `warnings.filterwarnings('ignore')`
-All warnings are silenced globally. This can hide important deprecation notices (e.g., the `base_estimator` → `estimator` rename in scikit-learn 1.2). **Recommendation:** use targeted warning filters.
+All warnings are silenced globally. **Recommendation:** use targeted warning filters.
 
 ### 7. ⚠️ Hardcoded Data Path
-`DATAPATH = './yearresult.csv'` is hardcoded. **Recommendation:** move to a config file or CLI argument.
+`DATAPATH = './Сбербанк/year_result.csv'` is hardcoded. **Recommendation:** move to a config file or CLI argument.
 
-### 8. ⚠️ No Reproducibility Guard on Data Shuffling
+### 8. ⚠️ No Reproducibility Guard on Data Ordering
 The pipeline relies on chronological ordering, but there is no explicit assertion that the DataFrame is sorted before splitting. **Recommendation:** add `assert df.index.is_monotonic_increasing` after datetime parsing.
 
-### 9. ⚠️ `nin=5` Lag Embedding is Arbitrary
-The `series_to_supervised(nin=5)` creates 5-step lag features without ablation. Optimal lag length is unknown. **Recommendation:** hyperparameter-search over `nin` ∈ {1, 3, 5, 10, 20}.
-
-### 10. ℹ️ Python 3.8 / Old Library Versions
-The notebook was developed on Python 3.8.5 with pandas 1.4.2. Newer versions (pandas 2.x, scikit-learn 1.4+) may require minor API updates.
+### 9. ⚠️ `n_in=3` Lag Embedding is Fixed
+The `series_to_supervised(n_in=3)` creates 3-step lag features without ablation. **Recommendation:** hyperparameter-search over `n_in` ∈ {1, 3, 5, 10}.
 
 ---
 
@@ -252,7 +281,6 @@ The notebook was developed on Python 3.8.5 with pandas 1.4.2. Newer versions (pa
 - [ ] Regime detection (HMM or volatility-regime filter)
 - [ ] Hyperparameter search (Optuna) with purged CV
 - [ ] Multi-ticker universe test
-- [ ] Feature selection (Boruta / SHAP-based)
 - [ ] SHAP values for interpretability
 - [ ] Modularize into Python package (src layout)
 - [ ] CI/CD with GitHub Actions + pytest
