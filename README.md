@@ -1,6 +1,8 @@
 # SBER 5-Minute Intraday Research Pipeline
 
-> **Research notebook:** XGBoost binary classifier with probability calibration on Finam OHLCV 5-minute candles for SBER (Sberbank). Pure research / backtesting environment — not production trading code.
+> **Research notebook:** CatBoost binary classifier with probability calibration on Finam OHLCV 5-minute candles for SBER (Sberbank). Pure research / backtesting environment — not production trading code.
+>
+> 🔄 **2026-05-02 update.** После расширенного анализа (см. [Расширенный анализ](#расширенный-анализ-sensitivity-model-zoo-таймфрейм)) основная конфигурация переведена на **CatBoost + ATR-target k_bars=3, k_atr=1.0** — комбинация победителей model-zoo и sensitivity-grid. Старая конфигурация (XGBoost + k_bars=5) задокументирована в истории.
 
 ---
 
@@ -116,27 +118,31 @@ Raw CSV
                                 └─► add_target()
                                       └─► build_X_y_for_model()   # series_to_supervised(n_in=3)
                                             └─► NaN/const/corr filters
-                                                  └─► XGBClassifier  (baseline)
+                                                  └─► CatBoostClassifier  (baseline)
                                                         └─► permutation_importance pruning
-                                                              └─► XGBClassifier  (pruned)
+                                                              └─► CatBoostClassifier  (pruned)
                                                                     └─► CalibratedClassifierCV (Platt sigmoid, FrozenEstimator)
 ```
 
-**XGBoost hyperparameters (research config):**
+**CatBoost hyperparameters (research config):**
 ```python
-XGBClassifier(
-    n_estimators=600,
-    max_depth=4,
+CatBoostClassifier(
+    iterations=500,
+    depth=5,
     learning_rate=0.05,
+    l2_leaf_reg=3.0,
     subsample=0.8,
-    colsample_bytree=0.7,
-    reg_alpha=0.1,
-    reg_lambda=1.0,
-    eval_metric='logloss',
-    random_state=42,
-    early_stopping_rounds=30,
+    rsm=0.7,
+    bootstrap_type='Bernoulli',
+    auto_class_weights='Balanced',
+    eval_metric='Logloss',
+    od_type='Iter', od_wait=30,
+    random_seed=42,
+    thread_count=-1,
+    verbose=False, allow_writing_files=False,
 )
 ```
+Observation: на текущей выборке CatBoost быстро сходится (best_iteration ≈ 9 для baseline и ≈ 105 для pruned) — early stopping по Logloss на Valid срабатывает рано.
 
 **Calibration:** Platt scaling via `CalibratedClassifierCV(method='sigmoid')` wrapped around a `FrozenEstimator` (sklearn ≥ 1.6) to fit on a dedicated calibration split. A fallback to legacy `cv='prefit'` is used for older sklearn versions.
 
@@ -146,7 +152,7 @@ XGBClassifier(
 
 | Split | Purpose | Approx. share |
 |---|---|---|
-| Train | Fit XGBoost | 70% |
+| Train | Fit CatBoost | 70% |
 | Valid | Early stopping & evaluation | 15% |
 | Calib | Fit Platt scaler | 15% |
 
@@ -160,37 +166,37 @@ Splits are strictly **chronological**.
 
 > 🚨 **Историческая правка (2026-05-02).** В предыдущей итерации вызывался `ta.dpo(..., lookahead=False)` — этого параметра **нет в API pandas_ta**, он молча попадал в `**kwargs` и DPO считался с `centered=True` (default), что создавало look-ahead bias на ~length/2 свечей вперёд (см. [pandas_ta Issue #60](https://github.com/twopirllc/pandas-ta/issues/60)). Это завышало AUC до ~0.82 — фейк. После фикса (`centered=False`) и полного аудита всех 109 индикаторов через [scripts/leakage_audit.py](scripts/leakage_audit.py) и [scripts/leakage_audit2.py](scripts/leakage_audit2.py) все остальные индикаторы прошли проверку на связь с будущими значениями. Ниже — честные метрики.
 
-### Pipeline funnel (с ATR-target K_BARS=5, K_ATR=1.0)
+### Pipeline funnel (с ATR-target K_BARS=3, K_ATR=1.0, CatBoost)
 
 | Stage | Columns / Rows |
 |---|---|
 | TA indicators added | 109 |
 | Features after generation | 173 |
 | After NaN(>20%) filter | 165 |
-| Rows after ATR-target filter + `dropna()` | 15 958 |
+| Rows after ATR-target filter + `dropna()` | 12 100 |
 | Columns after `series_to_supervised(n_in=3)` | 660 |
-| After `&#124;corr&#124; > 0.95` filter | 347 |
-| After permutation-importance pruning | **69** |
-| Train / Valid / Calib | 11 170 / 2 393 / 2 395 |
+| After `&#124;corr&#124; > 0.95` filter | 356 |
+| After permutation-importance pruning | **26** |
+| Train / Valid / Calib | 8 467 / 1 814 / 1 816 |
 
-### A/B comparison: Baseline vs Permutation-Pruned (итог после A3)
+### A/B comparison: Baseline vs Permutation-Pruned (CatBoost + k_bars=3)
 
 Метрики со сплита Calib (out-of-sample, ~15% хвост ряда):
 
 | Stage | Features | Acc Calib | AUC Calib | LogLoss Calib | Brier Calib |
 |---|---|---|---|---|---|
-| Baseline XGB | 347 | 0.5203 | 0.5459 | 0.6892 | 0.2480 |
-| **Pruned XGB** | **69** | **0.5616** | **0.5670** | **0.6857** | **0.2463** |
-| XGB + Platt | 347 | 0.5257 | 0.5459 | 0.6891 | 0.2480 |
+| Baseline CB | 356 | 0.5319 | 0.5423 | 0.6915 | 0.2492 |
+| **Pruned CB** | **26** | **0.5787** | **0.6004** | **0.6801** | **0.2435** |
+| CB + Platt | 26 | 0.5694 | 0.6004 | 0.6780 | 0.2425 |
 
-Для сравнения, старый target «зелёная свеча» (для референса): Pruned XGB Valid AUC=0.5278, Acc=0.5198 — т.е. **новый ATR-target даёт +4pp к AUC и +4pp к accuracy на OOS** при вдвое меньшей выборке.
+Для сравнения с предыдущей итерацией (XGBoost + k_bars=5): Pruned XGB Calib AUC=0.5670, Acc=0.5616 — т.е. **новая комбинация CatBoost + k=3 даёт +3.3pp к AUC и +1.7pp к accuracy на OOS**, при этом число признаков после прунинга уменьшилось с 69 до 26.
 
 **Key observations:**
-- AUC OOS **≈ 0.55–0.57** — реалистичный edge для 5-минутного intraday после фильтрации «флэтовых» баров
-- Permutation pruning убирает **278 из 347 признаков (80%)** — большинство в реальности шум, прунинг улучшает обобщаемость
-- Best XGBoost iteration: 16 (baseline) / 24 (pruned) — модель быстро упирается в предел сигнала
-- Pruned XGB выбран финальной моделью: AUC=0.567, Acc=0.562, LogLoss=0.686 на Calib
-- ATR-target даёт идеально сбалансированные классы 50/50 и поднимает AUC на +4pp против базового target
+- AUC OOS **≈ 0.60** — лучший результат среди всех протестированных конфигов на этом датасете
+- Permutation pruning убирает **330 из 356 признаков (93%)** — pruning ещё агрессивнее работает на CatBoost-сигналах
+- Best CatBoost iteration: 9 (baseline) / 105 (pruned) — модель уверенно использует более глубокие итерации после прунинга шумных фичей
+- Pruned CB + Platt выбран финальной моделью: AUC=0.6004, Acc=0.5694, LogLoss=0.6780 на Calib
+- ATR-target k_bars=3 (3 свечи = 15 мин) даёт сбалансированные классы 50/50 и более сильный сигнал, чем k_bars=5 (25 мин)
 - No transaction costs or slippage в самом ноутбуке — см. секцию A4+A2 ниже и [`scripts/threshold_strategy.py`](scripts/threshold_strategy.py) для P&L с издержками
 
 ---
@@ -225,7 +231,79 @@ Grid search по конфигам k_bars ∈ {1, 3, 5} × k_atr ∈ {0.5 .. 1.5}
 | 3 | 1.00 | 12 097 | 0.562 | 0.568 | 0.655 | prec=0.500, N=88 | prec=0.598, N=776 |
 | 1 | 0.50 | 13 853 | 0.573 | 0.535 | 0.586 | prec=0.550, N=20 | prec=0.571, N=357 |
 
-**Ключевой вывод:** при k_bars=5, k_atr=1.0 (движение ≥1 ATR за 5 свечей) хвосты **симметрично открываются**: впервые LONG даёт реальный хвост (389 сигналов OOS с prec=0.617), AUC поднимается с 0.52 до 0.58. Смена target с «зелёная свеча» на «движение ≥ ATR» резко улучшает предсказуемость, средневзвешенный сигнал ~58% precision в обе стороны. Для реальной торговли требуется выполнить walk-forward валидацию и посчитать чистый P&L с издержками на этой конфигурации.
+**Промежуточный вывод:** при k_bars=5, k_atr=1.0 (движение ≥1 ATR за 5 свечей) хвосты **симметрично открываются**: впервые LONG даёт реальный хвост (389 сигналов OOS с prec=0.617), AUC поднимается с 0.52 до 0.58.
+
+---
+
+## Расширенный анализ: sensitivity, model zoo, таймфрейм
+
+По следам внедрения ATR-target было проведено три дополнительных эксперимента.
+
+### 1. Sensitivity по (k_bars, k_atr)
+
+Скрипт: [`scripts/sensitivity_grid.py`](scripts/sensitivity_grid.py) · результаты: [`scripts/sensitivity_grid_results.json`](scripts/sensitivity_grid_results.json)
+
+Прогнана сетка k_bars ∈ {3, 5, 7, 10} × k_atr ∈ {0.75, 1.0, 1.25} — 12 конфигов, XGBoost+Platt, те же сплиты 70/15/15.
+
+| k_bars | k_atr | N | AUC valid | AUC calib | Acc calib | LONG p≥0.55 (Calib) | SHORT p≤0.45 (Calib) |
+|---:|---:|---:|---:|---:|---:|---|---|
+| **3** | **1.0** | 14 487 | 0.573 | **0.577** | 0.556 | **prec=0.570, N=386** | **prec=0.625, N=381** |
+| 5 | 1.0 | 18 844 | 0.538 | 0.567 | 0.551 | prec=0.549, N=215 | prec=0.636, N=319 |
+| 7 | 0.75 | 25 760 | 0.555 | 0.562 | 0.541 | prec=0.569, N=641 | prec=0.580, N=742 |
+| 7 | 1.0 | 21 507 | 0.551 | 0.562 | 0.547 | prec=0.517, N=433 | prec=0.593, N=769 |
+| 3 | 0.75 | 19 324 | 0.548 | 0.558 | 0.550 | prec=0.559, N=236 | prec=0.606, N=371 |
+| 3 | 1.25 | 10 769 | 0.562 | 0.561 | 0.526 | prec=0.524, N=143 | prec=0.610, N=480 |
+| 10 | 0.75 | 28 128 | 0.547 | 0.546 | 0.532 | prec=0.525, N=265 | prec=0.569, N=1 143 |
+| 10 | 1.0 | 24 305 | 0.536 | 0.541 | 0.551 | prec=0.625, N=48 | prec=0.537, N=818 |
+| 10 | 1.25 | 20 889 | 0.533 | 0.535 | 0.527 | prec=0.455, N=22 | prec=0.556, N=795 |
+
+**Вывод:** новый лидер — **k_bars=3, k_atr=1.0** (AUC_c=0.577 вместо 0.567 у k=5). Он же даёт сбалансированные хвосты: по ~380 сигналов в каждую сторону с prec 0.57–0.62. Движение «≥1 ATR за 3 свечи (15 мин)» оказалось предсказуемее, чем за 5 или 7 свечей — логично: на 5-минутном фрейме ближайшие свечи несут больше информации. **k_bars=10 стабильно хуже** — горизонт в 50 мин уже не предсказуем на 5-минутных фичах.
+
+### 2. Model zoo на ATR-target (k=5, k_atr=1.0)
+
+Скрипт: [`scripts/model_zoo_atr.py`](scripts/model_zoo_atr.py) · результаты: [`scripts/model_zoo_atr_results.json`](scripts/model_zoo_atr_results.json)
+
+7 моделей с Platt-калибровкой на одном и том же X. Метрики на Calib (OOS):
+
+| Model | AUC valid | AUC calib | Acc calib | LogLoss | LONG p≥0.55 | SHORT p≤0.45 |
+|---|---:|---:|---:|---:|---|---|
+| **CatBoost** | **0.579** | **0.606** | **0.580** | **0.678** | **prec=0.562, N=787** | **prec=0.660, N=592** |
+| LightGBM | 0.572 | 0.588 | 0.561 | 0.681 | prec=0.578, N=510 | prec=0.638, N=668 |
+| ExtraTrees | 0.541 | 0.585 | 0.555 | 0.685 | prec=0.312, N=16 | prec=0.641, N=618 |
+| RandomForest | 0.542 | 0.580 | 0.550 | 0.687 | prec=0.273, N=11 | prec=0.652, N=359 |
+| XGBoost (база) | 0.538 | 0.567 | 0.551 | 0.687 | prec=0.549, N=215 | prec=0.636, N=319 |
+| LogReg(L2) | 0.516 | 0.561 | 0.523 | 0.690 | — (нет хвоста) | — |
+| HistGBM | 0.529 | 0.548 | 0.524 | 0.690 | prec=0.572, N=236 | prec=0.648, N=105 |
+
+**Вывод:** из 7 протестированных моделей **CatBoost жёсткий лидер** — AUC на +4pp выше XGBoost (0.606 vs 0.567), accuracy 0.580 vs 0.551. Главное — CatBoost даёт **оба хвоста с prec ≥0.56 на сотнях сигналов**, в то время как RandomForest/ExtraTrees «схлопывают» LONG-хвост (N=11–16). LightGBM второй, но в ~7× медленнее (158с против 22с у CatBoost на этой выборке).
+
+**Рекомендация:** да, имеет смысл поменять основную модель на CatBoost. Это самый большой скачок в рамках текущего фреймворка (+4pp AUC «бесплатно»).
+
+### 3. Таймфреймы: 5m vs 10m vs 15m
+
+Скрипт: [`scripts/timeframe_test.py`](scripts/timeframe_test.py) · результаты: [`scripts/timeframe_test_results.json`](scripts/timeframe_test_results.json)
+
+Сырые 5-минутные бары ресемплены в 10m и 15m, повторился весь pipeline (109 TA + ATR-target):
+
+| Timeframe | k_bars | N (после ATR-target) | AUC valid | **AUC calib** | Acc calib | LONG p≥0.55 | SHORT p≤0.45 |
+|---|---:|---:|---:|---:|---:|---|---|
+| **5m**  | **5** | **18 844** | 0.538 | **0.567** | 0.551 | prec=0.549, N=215 | prec=0.636, N=319 |
+| 10m | 5 | 8 895 | 0.514 | 0.490 | 0.515 | — (N=0) | prec=0.485, N=239 |
+| 15m | 5 | 5 921 | 0.542 | 0.504 | 0.509 | — (N=0) | prec=0.520, N=419 |
+| 10m | 3 | 6 622 | 0.506 | 0.484 | 0.504 | — | — |
+| 15m | 3 | 4 400 | 0.526 | 0.489 | 0.519 | — | prec=0.508, N=358 |
+
+**Вывод:** переход на 10m и 15m **ухудшает OOS-метрики до случайного уровня или ниже** (AUC 0.49–0.50). Причин две: (1) выборка в 2–3 раза меньше — быстрее переобучение; (2) TA-индикаторы спроектированы/оптимизированы для более мелкого фрейма — на 15m они срезают быстрые движения.
+
+**Рекомендация:** остаться на 5m — фрейм повышать не стоит. Альтернатива — попробовать **1m** (если будет доступна), но это резко повышает стоимость издержек (бид/аск-спред съедает больше).
+
+### Сводный итог (ответ на 3 вопроса)
+
+1. **Sensitivity:** вместо (k=5, k_atr=1.0) лучше (k=3, k_atr=1.0) — AUC_c вырастает с 0.567 до 0.577.
+2. **Модель:** да, стоит поменять XGBoost на **CatBoost** — самый большой прирост (AUC 0.567 → 0.606, +4pp).
+3. **Таймфрейм:** нет, повышать не стоит. 10m/15m резко ухудшают OOS (AUC 0.49–0.50).
+
+**Совместное внедрение (1)+(2) — реализовано в основном ноутбуке:** CatBoost + (k_bars=3, k_atr=1.0) дал **AUC_c = 0.6004**, Acc=0.5694, LogLoss=0.6780 на Calib — лучший результат на этом датасете.
 
 ---
 
@@ -291,7 +369,7 @@ jupyter nbconvert --to notebook --execute sber_intraday_pipeline.ipynb \
 | 11 | `build_feature_dataframe` — 109 TA indicators + target |
 | 13–14 | EDA — feature distributions and target balance |
 | 16 | `build_X_y_for_model(n_in=3)` + Train/Valid/Calib split + filters & diagnostic counters |
-| 18–19 | Baseline XGBoost training + classification report |
+| 18–19 | Baseline CatBoost training + classification report |
 | 20–21 | **Permutation-importance pruning + A/B comparison + final-model selection** |
 | 23 | Probability calibration (`FrozenEstimator` → Platt) |
 | 24 | Calibration plots |
@@ -337,7 +415,11 @@ The `series_to_supervised(n_in=3)` creates 3-step lag features without ablation.
 
 - [x] Look-ahead bias audit (DPO `centered=False` fix — see историческую правку в [Results](#results))
 - [x] A4+A2: стратегия «торгуем только в хвостах» + P&L с издержками (неприбыльно при 10 bps)
-- [x] A3: альтернативный target = движение ≥ k·ATR за k свечей + grid search (победитель k=5, k_atr=1.0, AUC 0.567–0.580 OOS) — **внедрён как основной target в [`sber_intraday_pipeline.ipynb`](sber_intraday_pipeline.ipynb)**
+- [x] A3: альтернативный target = движение ≥ k·ATR за k свечей + grid search (победитель k=5, k_atr=1.0, AUC 0.567–0.580 OOS)
+- [x] Sensitivity grid k_bars × k_atr (4×3) — победитель k=3, k_atr=1.0 (AUC_c=0.577) — см. [`scripts/sensitivity_grid.py`](scripts/sensitivity_grid.py)
+- [x] Model zoo на ATR-target — победитель CatBoost (AUC=0.606 vs XGB 0.567) — см. [`scripts/model_zoo_atr.py`](scripts/model_zoo_atr.py)
+- [x] Timeframe test 5m/10m/15m — оставаться на 5m — см. [`scripts/timeframe_test.py`](scripts/timeframe_test.py)
+- [x] **Combined: CatBoost + k_bars=3, k_atr=1.0 → AUC_c = 0.6004** — внедрён как основная конфигурация в [`sber_intraday_pipeline.ipynb`](sber_intraday_pipeline.ipynb)
 - [ ] Walk-forward cross-validation (`TimeSeriesSplit`) на ATR-конфиге
 - [ ] Net P&L backtest with commission + slippage model на ATR-конфиге
 - [ ] Regime detection (HMM or volatility-regime filter)
