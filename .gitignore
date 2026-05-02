@@ -1,0 +1,8 @@
+# Котировки и данные не хранятся в git
+Сбербанк/
+*.csv
+
+# Артефакты Jupyter
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
